@@ -56,6 +56,7 @@ def reconstruction_loss(
         state_loss (Tensor): the value of the state loss.
         continue_loss (Tensor): the value of the continue loss (0 if it is not computed).
         reconstruction_loss (Tensor): the value of the overall reconstruction loss.
+        reconstruction_loss_batch (Tensor): the individual values of the reconstruction loss for the whole batch.
     """
     rewards.device
     observation_loss = -sum([po[k].log_prob(observations[k]) for k in po.keys()])
@@ -77,9 +78,11 @@ def reconstruction_loss(
         continue_loss = continue_scale_factor * -pc.log_prob(continue_targets)
     else:
         continue_loss = torch.zeros_like(reward_loss)
-    reconstruction_loss = (kl_regularizer * kl_loss + observation_loss + reward_loss + continue_loss).mean()
+    reconstruction_loss_batch = kl_regularizer * kl_loss + observation_loss + reward_loss + continue_loss
+    reconstruction_loss = torch.mean(reconstruction_loss_batch)
     return (
         reconstruction_loss,
+        reconstruction_loss_batch,
         kl.mean(),
         kl_loss.mean(),
         reward_loss.mean(),

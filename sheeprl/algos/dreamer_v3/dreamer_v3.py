@@ -60,7 +60,7 @@ def train(
     is_continuous: bool,
     actions_dim: Sequence[int],
     moments: Moments,
-) -> None:
+) -> torch.Tensor:
     """Runs one-step update of the agent.
 
     Args:
@@ -78,6 +78,9 @@ def train(
         is_continuous (bool): whether or not the environment is continuous.
         actions_dim (Sequence[int]): the actions dimension.
         moments (Moments): the moments for normalizing the lambda values.
+
+    Returns:
+        torch.Tensor: the resulting world model loss for the given data data.
     """
     # The environment interaction goes like this:
     # Actions:           a0       a1       a2      a4
@@ -173,7 +176,7 @@ def train(
 
     # World model optimization step. Eq. 4 in the paper
     world_optimizer.zero_grad(set_to_none=True)
-    rec_loss, kl, state_loss, reward_loss, observation_loss, continue_loss = reconstruction_loss(
+    rec_loss, rec_loss_batch, kl, state_loss, reward_loss, observation_loss, continue_loss = reconstruction_loss(
         po,
         batch_obs,
         pr,
@@ -356,6 +359,7 @@ def train(
     critic_optimizer.zero_grad(set_to_none=True)
     world_optimizer.zero_grad(set_to_none=True)
 
+    return rec_loss_batch
 
 @register_algorithm()
 def main(fabric: Fabric, cfg: Dict[str, Any]):
@@ -544,6 +548,8 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
     step_data["truncated"] = np.zeros((1, cfg.env.num_envs, 1))
     step_data["terminated"] = np.zeros((1, cfg.env.num_envs, 1))
     step_data["is_first"] = np.ones_like(step_data["terminated"])
+    step_data["replay_priority"] = 1e5 * np.ones((1, cfg.env.num_envs, 1))
+    step_data["replay_visit_count"] = np.zeros((1, cfg.env.num_envs, 1))
     player.init_states()
 
     cumulative_per_rank_gradient_steps = 0
@@ -647,6 +653,8 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
                 reset_data["actions"] = np.zeros((1, reset_envs, np.sum(actions_dim)))
                 reset_data["rewards"] = step_data["rewards"][:, dones_idxes]
                 reset_data["is_first"] = np.zeros_like(reset_data["terminated"])
+                reset_data["replay_priority"] = 1e5 * np.ones((1, reset_envs, 1))
+                reset_data["replay_visit_count"] = np.zeros((1, reset_envs, 1))
                 rb.add(reset_data, dones_idxes, validate_args=cfg.buffer.validate_args)
 
                 # Reset already inserted step data
@@ -661,7 +669,7 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
             ratio_steps = policy_step - prefill_steps * policy_steps_per_iter
             per_rank_gradient_steps = ratio(ratio_steps / world_size)
             if per_rank_gradient_steps > 0:
-                local_data = rb.sample_tensors(
+                local_data, buffer_indices = rb.sample_tensors(
                     cfg.algo.per_rank_batch_size,
                     sequence_length=cfg.algo.per_rank_sequence_length,
                     n_samples=per_rank_gradient_steps,
@@ -669,8 +677,11 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
                     device=fabric.device,
                     from_numpy=cfg.buffer.from_numpy,
                 )
+
+                wm_losses = np.empty((cfg.algo.per_rank_sequence_length, 0))
+                
                 with timer("Time/train_time", SumMetric, sync_on_compute=cfg.metric.sync_on_compute):
-                    for i in range(per_rank_gradient_steps):
+                    for i in range(per_rank_gradient_steps): # I'm not sure how often this will be called. Should I count cycle one as a "visit" for the replay buffer priority? It has only been sampled once, so I will only count it once for now.
                         if (
                             cumulative_per_rank_gradient_steps % cfg.algo.critic.per_rank_target_network_update_freq
                             == 0
@@ -679,7 +690,7 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
                             for cp, tcp in zip(critic.module.parameters(), target_critic.parameters()):
                                 tcp.data.copy_(tau * cp.data + (1 - tau) * tcp.data)
                         batch = {k: v[i].float() for k, v in local_data.items()}
-                        train(
+                        wm_loss = train(
                             fabric,
                             world_model,
                             actor,
@@ -695,8 +706,28 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
                             actions_dim,
                             moments,
                         )
+                        wm_losses = np.concatenate([wm_losses, wm_loss.cpu().detach().numpy()], axis=1)
                         cumulative_per_rank_gradient_steps += 1
                     train_step += world_size
+
+                # calculate and set the priority of the sampled transitions (+ visit count) according to the sampled buffer indices
+                lower_idx = 0
+                for buffer_idx, buffer_idxs in enumerate(buffer_indices):
+                    if buffer_idxs.shape[0] == 0:
+                        continue
+                    upper_idx = lower_idx + buffer_idxs.shape[0]
+                    this_buffers_losses = wm_losses[:, lower_idx:upper_idx]
+                    lower_idx = upper_idx
+                    for sequence_i in range(buffer_idxs.shape[0]): # these are the individual sequences in the batch (of length cfg.algo.per_rank_sequence_length)
+                        visit_count = rb.buffer[buffer_idx]["replay_visit_count"].array[buffer_idxs[sequence_i, :], 0, 0]
+                        hyper_c = 1e4
+                        hyper_beta = 0.7
+                        hyper_epsilon = 0.01
+                        hyper_alpha = 0.7
+                        priorities = (hyper_c * np.power(hyper_beta, visit_count)) + np.power((this_buffers_losses[:,sequence_i] + hyper_epsilon), hyper_alpha)
+                        rb.buffer[buffer_idx]["replay_priority"].array[buffer_idxs[sequence_i, :], 0, 0] = priorities
+                        rb.buffer[buffer_idx]["replay_visit_count"].array[buffer_idxs[sequence_i, :], 0, 0] += 1
+
 
         # Log metrics
         if cfg.metric.log_level > 0 and (policy_step - last_log >= cfg.metric.log_every or iter_num == total_iters):

@@ -7,7 +7,7 @@ import typing
 import uuid
 from itertools import compress
 from pathlib import Path
-from typing import Dict, Optional, Sequence, Type
+from typing import Dict, List, Optional, Sequence, Type, Union
 
 import numpy as np
 import torch
@@ -400,7 +400,7 @@ class SequentialReplayBuffer(ReplayBuffer):
         n_samples: int = 1,
         sequence_length: int = 1,
         **kwargs,
-    ) -> Dict[str, np.ndarray]:
+    ) -> Union[Dict[str, np.ndarray], np.ndarray]:
         """Sample elements from the replay buffer in a sequential manner, without considering the episode
         boundaries.
 
@@ -415,6 +415,7 @@ class SequentialReplayBuffer(ReplayBuffer):
         Returns:
             Dict[str, np.ndarray]: the sampled dictionary with a shape of
             [n_samples, sequence_length, batch_size, ...].
+            np.ndarray: the indices of the sampled elements.
         """
         # the batch_size can be fused with the number of samples to have single batch size
         batch_dim = batch_size * n_samples
@@ -449,11 +450,12 @@ class SequentialReplayBuffer(ReplayBuffer):
             valid_idxes = np.array(
                 list(range(0, first_range_end)) + list(range(self._pos, second_range_end)), dtype=np.intp
             )
-            # start_idxes are the indices of the first elements of the sequences
-            start_idxes = valid_idxes[self._rng.integers(0, len(valid_idxes), size=(batch_dim,), dtype=np.intp)]
+            probabs = self["replay_priority"].array[valid_idxes, 0, 0] / np.sum(self["replay_priority"].array[valid_idxes, 0, 0])
+            start_idxes = self._rng.choice(valid_idxes, size=(batch_dim,), p=probabs)
         else:
             # when the buffer is not full, we need to start the sequence so that it does not go out of bounds
-            start_idxes = self._rng.integers(0, self._pos - sequence_length + 1, size=(batch_dim,), dtype=np.intp)
+            probabs = self["replay_priority"].array[:self._pos - sequence_length + 1, 0, 0] / np.sum(self["replay_priority"].array[:self._pos - sequence_length + 1, 0, 0])
+            start_idxes = self._rng.choice(np.arange(0, self._pos - sequence_length + 1), size=(batch_dim,), p=probabs)
 
         # chunk_length contains the relative indices of the sequence (0, 1, ..., sequence_length-1)
         chunk_length = np.arange(sequence_length, dtype=np.intp).reshape(1, -1)
@@ -462,7 +464,7 @@ class SequentialReplayBuffer(ReplayBuffer):
         # (n_samples, sequence_length, batch_size)
         return self._get_samples(
             idxes, batch_size, n_samples, sequence_length, sample_next_obs=sample_next_obs, clone=clone
-        )
+        ), idxes
 
     def _get_samples(
         self,
@@ -660,7 +662,7 @@ class EnvIndependentReplayBuffer:
         clone: bool = False,
         n_samples: int = 1,
         **kwargs,
-    ) -> Dict[str, np.ndarray]:
+    ) -> Union[Dict[str, np.ndarray], List[np.ndarray]]:
         """Samples data from the buffer. The returned samples are sampled given the 'buffer_cls' class
         used to initialize the buffer. The samples are concatenated along the 'buffer_cls.batch_axis' axis.
 
@@ -675,6 +677,7 @@ class EnvIndependentReplayBuffer:
             Dict[str, np.ndarray]: the sampled dictionary with a shape of
             [n_samples, sequence_length, batch_size, ...] if 'buffer_cls' is a 'SequentialReplayBuffer',
             otherwise [n_samples, batch_size, ...] if 'buffer_cls' is a 'ReplayBuffer'.
+            List[np.ndarray]: the indices of the sampled elements, seperated according to the env they were sampled from.
         """
         if batch_size <= 0 or n_samples <= 0:
             raise ValueError(f"'batch_size' ({batch_size}) and 'n_samples' ({n_samples}) must be both greater than 0")
@@ -682,21 +685,26 @@ class EnvIndependentReplayBuffer:
             raise RuntimeError("The buffer has not been initialized. Try to add some data first.")
 
         bs_per_buf = np.bincount(self._rng.integers(0, self._n_envs, (batch_size,)))
-        per_buf_samples = [
-            b.sample(
-                batch_size=bs,
-                sample_next_obs=sample_next_obs,
-                clone=clone,
-                n_samples=n_samples,
-                **kwargs,
-            )
-            for b, bs in zip(self._buf, bs_per_buf)
-            if bs > 0
-        ]
+        per_env_idxs = []
+        per_buf_samples = []
+        for b, bs in zip(self._buf, bs_per_buf):
+            if bs > 0:
+                per_buf_sample, per_env_idx = b.sample(
+                    batch_size=bs,
+                    sample_next_obs=sample_next_obs,
+                    clone=clone,
+                    n_samples=n_samples,
+                    **kwargs,
+                )
+                per_buf_samples.append(per_buf_sample)
+                per_env_idxs.append(per_env_idx)
+            else:
+                per_env_idxs.append(np.empty((0, 64)))
+
         samples = {}
         for k in per_buf_samples[0].keys():
             samples[k] = np.concatenate([s[k] for s in per_buf_samples], axis=self._concat_along_axis)
-        return samples
+        return samples, per_env_idxs
 
     @torch.no_grad()
     def sample_tensors(
@@ -709,7 +717,7 @@ class EnvIndependentReplayBuffer:
         device: str | torch.dtype = "cpu",
         from_numpy: bool = False,
         **kwargs,
-    ) -> Dict[str, Tensor]:
+    ) -> Union[Dict[str, Tensor], List[np.ndarray]]:
         """Sample elements from the replay buffer and convert them to torch tensors.
 
         Args:
@@ -730,8 +738,9 @@ class EnvIndependentReplayBuffer:
             Dict[str, Tensor]: the sampled dictionary, containing the sampled array,
             one for every key, with a shape of [n_samples, sequence_length, batch_size, ...] if 'buffer_cls' is a
             'SequentialReplayBuffer', otherwise [n_samples, batch_size, ...] if 'buffer_cls' is a 'ReplayBuffer'.
+            List[np.ndarray]: the indices of the sampled elements, seperated according to the env they were sampled from.
         """
-        samples = self.sample(
+        samples, per_env_idxs = self.sample(
             batch_size=batch_size,
             sample_next_obs=sample_next_obs,
             clone=clone,
@@ -740,7 +749,7 @@ class EnvIndependentReplayBuffer:
         )
         return {
             k: get_tensor(v, dtype=dtype, clone=clone, device=device, from_numpy=from_numpy) for k, v in samples.items()
-        }
+        }, per_env_idxs
 
 
 class EpisodeBuffer:
