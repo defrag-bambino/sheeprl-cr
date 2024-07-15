@@ -552,9 +552,18 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
     step_data["replay_visit_count"] = np.zeros((1, cfg.env.num_envs, 1))
     player.init_states()
 
+    env_change_happend = False
     cumulative_per_rank_gradient_steps = 0
     for iter_num in range(start_iter, total_iters + 1):
         policy_step += policy_steps_per_iter
+
+        if iter_num == int(total_iters // 2) and not env_change_happend:
+            env_change_happend = True
+            for env in envs.envs:
+                env.change()
+            # clear the replay buffer
+            rb.clear()
+            learning_starts += iter_num # to first refill the replay buffer a bit again before continuing to train
 
         with torch.inference_mode():
             # Measure environment interaction time: this considers both the model forward

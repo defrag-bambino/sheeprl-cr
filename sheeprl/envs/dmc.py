@@ -242,3 +242,24 @@ class DMCWrapper(gym.Wrapper):
 
     def render(self, camera_id: Optional[int] = None) -> np.ndarray:
         return self.env.physics.render(height=self._height, width=self._width, camera_id=camera_id or self._camera_id)
+    
+    def change(self):
+        #self.env.physics.named.model.tendon_range["string"] = np.array([0, 0.5])
+        #print("setting to constraints string", self.env.physics.named.model.tendon_range["string"])
+        self.env.physics.named.model.geom_size["foot_back_left"] += np.array([0, 0.3, 0])
+        self.env.physics.named.model.geom_size["foot_back_right"] += np.array([0, 0.3, 0])
+        self.env.physics.named.model.geom_size["foot_front_left"] += np.array([0, 0.3, 0])
+        self.env.physics.named.model.geom_size["foot_front_right"] += np.array([0, 0.3, 0])
+        self.env.physics.named.model.geom_pos["foot_back_left"] -= np.array([1, 0, 0])
+        self.env.physics.named.model.geom_pos["foot_back_right"] -= np.array([1, 0, 0])
+        self.env.physics.named.model.geom_pos["foot_front_left"] -= np.array([1, 0, 0])
+        self.env.physics.named.model.geom_pos["foot_front_right"] -= np.array([1, 0, 0])
+        self.env.physics.named.model.geom_rbound["foot_back_left"] = np.sum(self.env.physics.named.model.geom_size["foot_back_left"])
+        self.env.physics.named.model.geom_rbound["foot_back_right"] = np.sum(self.env.physics.named.model.geom_size["foot_back_right"])
+        self.env.physics.named.model.geom_rbound["foot_front_left"] = np.sum(self.env.physics.named.model.geom_size["foot_front_left"])
+        self.env.physics.named.model.geom_rbound["foot_front_right"] = np.sum(self.env.physics.named.model.geom_size["foot_front_right"])
+        self.env.physics.named.model.geom_pos["toe_back_left"] -= np.array([0,0,0.3])
+        self.env.physics.named.model.geom_pos["toe_back_right"] -= np.array([0,0,0.3])
+        self.env.physics.named.model.geom_pos["toe_front_left"] -= np.array([0,0,0.3])
+        self.env.physics.named.model.geom_pos["toe_front_right"] -= np.array([0,0,0.3])
+        print("setting to geom_size foot_back_left", self.env.physics.named.model.geom_size["foot_back_left"])

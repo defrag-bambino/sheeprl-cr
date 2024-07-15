@@ -7,6 +7,7 @@ import typing
 import uuid
 from itertools import compress
 from pathlib import Path
+import shutil
 from typing import Dict, List, Optional, Sequence, Type, Union
 
 import numpy as np
@@ -359,6 +360,13 @@ class ReplayBuffer:
                 value_to_add = np.copy(value.array)
         self.buffer.update({key: value_to_add})
 
+    def clear(self) -> None:
+        """Clear the buffer."""
+        self._buf: Dict[str, np.ndarray | MemmapArray] = {}
+        self._pos = 0
+        self._full = False
+        shutil.rmtree(self._memmap_dir, ignore_errors=False)
+        self._memmap_dir.mkdir(parents=True, exist_ok=True)
 
 class SequentialReplayBuffer(ReplayBuffer):
     batch_axis: int = 2
@@ -526,7 +534,10 @@ class SequentialReplayBuffer(ReplayBuffer):
                 if clone:
                     samples[f"next_{k}"] = samples[f"next_{k}"].copy()
         return samples
-
+    
+    def clear(self) -> None:
+        """Clear the buffer."""
+        super().clear()
 
 class EnvIndependentReplayBuffer:
     def __init__(
@@ -750,7 +761,12 @@ class EnvIndependentReplayBuffer:
         return {
             k: get_tensor(v, dtype=dtype, clone=clone, device=device, from_numpy=from_numpy) for k, v in samples.items()
         }, per_env_idxs
-
+    
+    def clear(self) -> None:
+        """Clear the buffer."""
+        if self._buf is not None:
+            for b in self._buf:
+                b.clear()
 
 class EpisodeBuffer:
     """A replay buffer that stores separately the episodes.

@@ -115,6 +115,7 @@ def test(
     env: gym.Env = make_env(cfg, cfg.seed, 0, log_dir, "test" + (f"_{test_name}" if test_name != "" else ""))()
     done = False
     cumulative_rew = 0
+    env.change()
     obs = env.reset(seed=cfg.seed)[0]
     player.num_envs = 1
     player.init_states()
