@@ -553,6 +553,7 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
     player.init_states()
 
     env_change_happend = False
+    
     cumulative_per_rank_gradient_steps = 0
     for iter_num in range(start_iter, total_iters + 1):
         policy_step += policy_steps_per_iter
@@ -672,6 +673,42 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
                 step_data["truncated"][:, dones_idxes] = np.zeros_like(step_data["truncated"][:, dones_idxes])
                 step_data["is_first"][:, dones_idxes] = np.ones_like(step_data["is_first"][:, dones_idxes])
                 player.init_states(dones_idxes)
+
+
+            ## Save the recurrent and stochastic latent states for the imagination phase
+            stochastic_state = player.stochastic_state.clone()
+            recurrent_state = player.recurrent_state.clone()
+            imagined_latent_states = torch.cat((stochastic_state, recurrent_state), -1)
+            imagination_steps = cfg.algo.horizon
+            rb_imagination = SequentialReplayBuffer(imagination_steps, cfg.env.num_envs)
+
+            # deciede if you want to take the actions from the buffer
+            # (i.e., the actions actually played by the agent)
+            # or imagine them and compare with the actions actually played by the agent
+            imagine_actions = True
+            step_data_imag = {}
+            for j in range(imagination_steps):
+                if imagine_actions:
+                    # imagined actions
+                    actions_imag = actor(imagined_latent_states.detach())[0][0]
+                else:
+                    # actions_imag actually played by the agent
+                    actions_imag = torch.tensor(
+                        rb["actions"][-imagination_steps + j],
+                        device=fabric.device,
+                        dtype=torch.float32,
+                    )[None]
+
+                # imagination step
+                stochastic_state, recurrent_state = world_model.rssm.imagination(stochastic_state, recurrent_state, actions_imag)
+                # update current state
+                imagined_latent_states = torch.cat((stochastic_state.view(1, 1, -1), recurrent_state), -1)
+                stochastic_state = stochastic_state.view(1, 1, -1)
+                rec_obs = world_model.observation_model(imagined_latent_states)
+                #step_data_imag["rgb"] = rec_obs["rgb"].unsqueeze(0).detach().cpu().numpy()
+                step_data_imag["vector"] = rec_obs["vector"].unsqueeze(0).detach().cpu().numpy()
+                step_data_imag["actions"] = actions_imag.unsqueeze(0).detach().cpu().numpy()
+                rb_imagination.add(step_data_imag)
 
         # Train the agent
         if iter_num >= learning_starts:
