@@ -551,8 +551,11 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
     step_data["replay_priority"] = 1e5 * np.ones((1, cfg.env.num_envs, 1))
     step_data["replay_visit_count"] = np.zeros((1, cfg.env.num_envs, 1))
     player.init_states()
+    step_data["stochastic_state"] = player.stochastic_state.detach().cpu().numpy()
+    step_data["recurrent_state"] = player.recurrent_state.detach().cpu().numpy()
 
     env_change_happend = False
+    imag_errors = None
     
     cumulative_per_rank_gradient_steps = 0
     for iter_num in range(start_iter, total_iters + 1):
@@ -651,6 +654,8 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
             step_data["terminated"] = terminated.reshape((1, cfg.env.num_envs, -1))
             step_data["truncated"] = truncated.reshape((1, cfg.env.num_envs, -1))
             step_data["rewards"] = clip_rewards_fn(rewards)
+            step_data["stochastic_state"] = player.stochastic_state.detach().cpu().numpy()
+            step_data["recurrent_state"] = player.recurrent_state.detach().cpu().numpy()
 
             dones_idxes = dones.nonzero()[0].tolist()
             reset_envs = len(dones_idxes)
@@ -665,6 +670,8 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
                 reset_data["is_first"] = np.zeros_like(reset_data["terminated"])
                 reset_data["replay_priority"] = 1e5 * np.ones((1, reset_envs, 1))
                 reset_data["replay_visit_count"] = np.zeros((1, reset_envs, 1))
+                reset_data["stochastic_state"] = step_data["stochastic_state"][:, dones_idxes]
+                reset_data["recurrent_state"] = step_data["recurrent_state"][:, dones_idxes]
                 rb.add(reset_data, dones_idxes, validate_args=cfg.buffer.validate_args)
 
                 # Reset already inserted step data
@@ -673,42 +680,59 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
                 step_data["truncated"][:, dones_idxes] = np.zeros_like(step_data["truncated"][:, dones_idxes])
                 step_data["is_first"][:, dones_idxes] = np.ones_like(step_data["is_first"][:, dones_idxes])
                 player.init_states(dones_idxes)
+                step_data["stochastic_state"][:, dones_idxes] = player.stochastic_state.detach().cpu().numpy()[:, dones_idxes]
+                step_data["recurrent_state"][:, dones_idxes] = player.recurrent_state.detach().cpu().numpy()[:, dones_idxes]
 
-
-            ## Save the recurrent and stochastic latent states for the imagination phase
-            stochastic_state = player.stochastic_state.clone()
-            recurrent_state = player.recurrent_state.clone()
-            imagined_latent_states = torch.cat((stochastic_state, recurrent_state), -1)
-            imagination_steps = cfg.algo.horizon
-            rb_imagination = SequentialReplayBuffer(imagination_steps, cfg.env.num_envs)
-
-            # deciede if you want to take the actions from the buffer
-            # (i.e., the actions actually played by the agent)
-            # or imagine them and compare with the actions actually played by the agent
-            imagine_actions = True
-            step_data_imag = {}
-            for j in range(imagination_steps):
-                if imagine_actions:
-                    # imagined actions
-                    actions_imag = actor(imagined_latent_states.detach())[0][0]
+            if iter_num > learning_starts:
+                imagination_steps = cfg.algo.horizon
+                data_len = next(iter(step_data.values())).shape[0]
+                imag_start_pos = (rb.buffer[0]._pos - data_len*imagination_steps) % rb._buffer_size
+                # select the step_data from imagination_steps ago from the replay buffer rb
+                # ensure the data is actually imagination_steps long, i.e. no terminated or truncated data
+                true_obs = rb.buffer[0]["state"][imag_start_pos:(imag_start_pos + data_len*imagination_steps)%rb._buffer_size]
+                true_actions = rb.buffer[0]["actions"][imag_start_pos:(imag_start_pos + data_len*imagination_steps)%rb._buffer_size]
+                terminateds = rb.buffer[0]["terminated"][imag_start_pos:(imag_start_pos + data_len*imagination_steps)%rb._buffer_size]
+                truncateds = rb.buffer[0]["truncated"][imag_start_pos:(imag_start_pos + data_len*imagination_steps)%rb._buffer_size]
+                if (terminateds.sum() > 0) or (truncateds.sum() > 0):
+                    pass # do not imagine when there was an episode end as the new state cannot be predicted accurately
                 else:
-                    # actions_imag actually played by the agent
-                    actions_imag = torch.tensor(
-                        rb["actions"][-imagination_steps + j],
-                        device=fabric.device,
-                        dtype=torch.float32,
-                    )[None]
+                    ## Save the initial recurrent and stochastic latent states for the imagination phase
+                    stochastic_state = torch.tensor(rb.buffer[0]["stochastic_state"][imag_start_pos], device=fabric.device, dtype=torch.float32).unsqueeze(0)
+                    recurrent_state = torch.tensor(rb.buffer[0]["recurrent_state"][imag_start_pos], device=fabric.device, dtype=torch.float32).unsqueeze(0)
+                    imagined_latent_states = torch.cat((stochastic_state, recurrent_state), -1)
+                    
+                    rb_imagination = SequentialReplayBuffer(imagination_steps, cfg.env.num_envs)
 
-                # imagination step
-                stochastic_state, recurrent_state = world_model.rssm.imagination(stochastic_state, recurrent_state, actions_imag)
-                # update current state
-                imagined_latent_states = torch.cat((stochastic_state.view(1, 1, -1), recurrent_state), -1)
-                stochastic_state = stochastic_state.view(1, 1, -1)
-                rec_obs = world_model.observation_model(imagined_latent_states)
-                #step_data_imag["rgb"] = rec_obs["rgb"].unsqueeze(0).detach().cpu().numpy()
-                step_data_imag["vector"] = rec_obs["vector"].unsqueeze(0).detach().cpu().numpy()
-                step_data_imag["actions"] = actions_imag.unsqueeze(0).detach().cpu().numpy()
-                rb_imagination.add(step_data_imag)
+                    # deciede if you want to take the actions from the buffer
+                    # (i.e., the actions actually played by the agent)
+                    # or imagine them and compare with the actions actually played by the agent
+                    imagine_actions = False
+                    step_data_imag = {}
+                    for j in range(imagination_steps):
+                        if imagine_actions:
+                            # imagined actions
+                            actions_imag = actor(imagined_latent_states.detach())[0][0]
+                        else:
+                            # actions_imag actually played by the agent
+                            actions_imag = torch.tensor(
+                                true_actions[j, :],
+                                device=fabric.device,
+                                dtype=torch.float32,
+                            )[None]
+
+                        # imagination step
+                        stochastic_state, recurrent_state = world_model.rssm.imagination(stochastic_state, recurrent_state, actions_imag)
+                        # update current state
+                        imagined_latent_states = torch.cat((stochastic_state.view(1, 1, -1), recurrent_state), -1)
+                        stochastic_state = stochastic_state.view(1, 1, -1)
+                        rec_obs = world_model.observation_model(imagined_latent_states)
+                        #step_data_imag["rgb"] = rec_obs["rgb"].unsqueeze(0).detach().cpu().numpy()
+                        step_data_imag["state"] = rec_obs["state"].unsqueeze(0).detach().cpu().numpy()
+                        step_data_imag["actions"] = actions_imag.unsqueeze(0).detach().cpu().numpy()
+                        rb_imagination.add(step_data_imag)
+
+                    # compare the imagined observations with the true ones
+                    imag_errors = np.abs(true_obs.squeeze(1) - rb_imagination["state"].squeeze(1).squeeze(1))
 
         # Train the agent
         if iter_num >= learning_starts:
@@ -788,6 +812,12 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
                 "Params/replay_ratio", cumulative_per_rank_gradient_steps * world_size / policy_step, policy_step
             )
 
+            # log imag_errors
+            if imag_errors is not None:
+                #fabric.log_dict({"imag_errors": np.sum(imag_errors)}, policy_step)
+                errs = np.sum(imag_errors, axis=0) / imag_errors.shape[0]
+                for i, e in enumerate(errs):
+                    fabric.log(f"imag_errors/{i}", e, policy_step)
             # Sync distributed timers
             if not timer.disabled:
                 timer_metrics = timer.compute()
