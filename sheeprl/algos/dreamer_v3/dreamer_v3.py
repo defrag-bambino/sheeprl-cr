@@ -556,7 +556,8 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
 
     env_change_happend = False
     imag_errors = None
-    
+    imag_errors_hist = []
+
     cumulative_per_rank_gradient_steps = 0
     for iter_num in range(start_iter, total_iters + 1):
         policy_step += policy_steps_per_iter
@@ -733,6 +734,7 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
 
                     # compare the imagined observations with the true ones
                     imag_errors = np.abs(true_obs.squeeze(1) - rb_imagination["state"].squeeze(1).squeeze(1))
+                    imag_errors_hist.append(imag_errors)
 
         # Train the agent
         if iter_num >= learning_starts:
@@ -818,6 +820,12 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
                 errs = np.sum(imag_errors, axis=0) / imag_errors.shape[0]
                 for i, e in enumerate(errs):
                     fabric.log(f"imag_errors/{i}", e, policy_step)
+                # std
+            if imag_errors is not None and len(imag_errors_hist) > (cfg.checkpoint.every // policy_steps_per_iter):
+                imag_errors_hist_part = np.array(imag_errors_hist[-(cfg.checkpoint.every // policy_steps_per_iter) :])
+                for i in range(imag_errors_hist_part.shape[1]):
+                    fabric.log(f"imag_errors/{i}_std", np.std(imag_errors_hist_part[:, i]), policy_step)
+
             # Sync distributed timers
             if not timer.disabled:
                 timer_metrics = timer.compute()
@@ -844,6 +852,14 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
         if (cfg.checkpoint.every > 0 and policy_step - last_checkpoint >= cfg.checkpoint.every) or (
             iter_num == total_iters and cfg.checkpoint.save_last
         ):
+            # compute the std of the imag_errors_hist over the last cfg.checkpoint.every//policy_steps_per_iter datapoints
+            # for each of the N dimensions (measurements) in the imag_errors_hist
+            imag_errors_stds = []
+            if imag_errors is not None and len(imag_errors_hist) > (cfg.checkpoint.every // policy_steps_per_iter):
+                imag_errors_hist_part = np.array(imag_errors_hist[-(cfg.checkpoint.every // policy_steps_per_iter) :])
+                for i in range(imag_errors_hist_part.shape[1]):
+                    imag_errors_stds.append(np.std(imag_errors_hist_part[:, i]))                    
+
             last_checkpoint = policy_step
             state = {
                 "world_model": world_model.state_dict(),
@@ -859,6 +875,8 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
                 "batch_size": cfg.algo.per_rank_batch_size * fabric.world_size,
                 "last_log": last_log,
                 "last_checkpoint": last_checkpoint,
+                "imag_errors_hist": imag_errors_hist,
+                "imag_errors_stds": imag_errors_stds,
             }
             ckpt_path = log_dir + f"/checkpoint/ckpt_{policy_step}_{fabric.global_rank}.ckpt"
             fabric.call(
