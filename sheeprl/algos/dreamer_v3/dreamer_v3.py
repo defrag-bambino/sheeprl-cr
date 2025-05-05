@@ -539,6 +539,79 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
             "policy_steps_per_iter value."
         )
 
+    # ADAPTION inference
+    imagination_steps = cfg.algo.horizon
+    cnt = 0
+    if cfg.checkpoint.resume_from:
+        with torch.inference_mode():
+            obs = envs.reset(seed=cfg.seed)[0]
+            real_actions_buffer = []
+            steps_since_reset = 0
+            player.num_envs = 1
+            player.init_states()
+            while 1:
+                # Act greedly through the environment
+                torch_obs = prepare_obs(fabric, obs, cnn_keys=cfg.algo.cnn_keys.encoder)
+                real_actions = player.get_actions(
+                    torch_obs, greedy=True, mask={k: v for k, v in torch_obs.items() if k.startswith("mask")}
+                )
+                if player.actor.is_continuous:
+                    real_actions = torch.stack(real_actions, -1).cpu().numpy()
+                else:
+                    real_actions = torch.stack([real_act.argmax(dim=-1) for real_act in real_actions], dim=-1).cpu().numpy()
+
+                # Single environment step
+                obs, reward, done, truncated, _ = envs.step(real_actions.reshape(envs.action_space.shape))
+                done = done or truncated
+                steps_since_reset += 1
+                if done:
+                    steps_since_reset = 0
+                    obs = envs.reset(seed=cfg.seed)[0]
+                    player.init_states()
+                real_actions_buffer.append(real_actions.reshape(envs.action_space.shape))
+
+                # imagination
+                if steps_since_reset >= imagination_steps:
+                    stochastic_state = player.stochastic_state
+                    recurrent_state = player.recurrent_state
+                    # deciede if you want to take the actions from the buffer
+                    # (i.e., the actions actually played by the agent)
+                    # or imagine them and compare with the actions actually played by the agent
+                    imagine_actions = False
+                    step_data_imag = []
+                    for j in range(imagination_steps):
+                        cnt += 1
+                        if cnt == 200000:
+                            for env in envs.envs:
+                                env.change()
+                        if imagine_actions:
+                            # imagined actions
+                            actions_imag = actor(imagined_latent_states.detach())[0][0]
+                        else:
+                            # actions_imag actually played by the agent
+                            actions_imag = torch.tensor(
+                                real_actions_buffer[-imagination_steps + j],
+                                device=fabric.device,
+                                dtype=torch.float32,
+                            )[None]
+
+                        # imagination step
+                        stochastic_state, recurrent_state = world_model.rssm.imagination(stochastic_state, recurrent_state, actions_imag)
+                        # update current state
+                        imagined_latent_states = torch.cat((stochastic_state.view(1, 1, -1), recurrent_state), -1)
+                        stochastic_state = stochastic_state.view(1, 1, -1)
+                        rec_obs = world_model.observation_model(imagined_latent_states)
+                        #step_data_imag["rgb"] = rec_obs["rgb"].unsqueeze(0).detach().cpu().numpy()
+                        step_data_imag.append(rec_obs["state"].squeeze(0).detach().cpu().numpy())
+                    
+                    # check the error between the last imagination_steps real_obs and imagined_obs
+                    if len(step_data_imag) >= imagination_steps:
+                        imag_errors = np.abs(np.array(obs["state"]) - np.array(step_data_imag).squeeze(1))
+                        errs = np.sum(imag_errors, axis=0) / imag_errors.shape[0]
+                        print("imag_errors", errs)
+                        for i, e in enumerate(errs):
+                            fabric.log(f"imag_errors/{i}", e, cnt)
+
     # Get the first environment observation and start the optimization
     step_data = {}
     obs = envs.reset(seed=cfg.seed)[0]
